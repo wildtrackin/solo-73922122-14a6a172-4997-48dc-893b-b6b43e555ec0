@@ -12,3 +12,8 @@ def lsn_to_int(lsn: str) -> int:
     """'0/16B3748' -> 整数，便于按提交位置做游标比较。"""
     high, low = lsn.split("/")
     return (int(high, 16) << 32) | int(low, 16)
+
+
+def int_to_lsn(value: int) -> str:
+    """整数 -> '0/16B3748'，用于把复制消息的 data_start 落库为 pg_lsn。"""
+    return f"{value >> 32:X}/{value & 0xFFFFFFFF:X}"

@@ -10,6 +10,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# 首次运行自动生成 .env（compose 变量替换与采集器配置都依赖它）
+if [ ! -f .env ]; then
+  echo "未发现 .env，已从 .env.example 生成（可按需修改后重跑）"
+  cp .env.example .env
+fi
+
 # 读取 .env
 set -a; . ./.env; set +a
 
@@ -83,7 +89,7 @@ check "删除记录旧值中的样本号" "S2026-0004" "$DEL_OLD"
 DEL_OLD_COLS=$(log_sql -c "SELECT (SELECT count(*) FROM jsonb_object_keys(old_values))
                              FROM result_change
                             WHERE slot_name='$SLOT_NAME' AND action='D' LIMIT 1;")
-check "删除旧值包含全部 4 列（REPLICA IDENTITY FULL）" "4" "$DEL_OLD_COLS"
+check "删除旧值包含全部 5 列（REPLICA IDENTITY FULL）" "5" "$DEL_OLD_COLS"
 DEL_NEW=$(log_sql -c "SELECT count(*) FROM result_change
                        WHERE slot_name='$SLOT_NAME' AND action='D' AND new_values IS NULL;")
 check "删除记录无新值" "1" "$DEL_NEW"
@@ -184,8 +190,22 @@ api_json "/commits?limit=1"
 CURSOR=$(api_get "/commits?limit=1" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_cursor'])")
 info "用 next_cursor 翻下一页: cursor=$CURSOR"
 api_json "/commits?limit=1&cursor=$CURSOR"
+
+info "按提交位置取单笔事务（LSN 含 '/'，直接拼在路径里）"
+ONE_LSN=$(api_get "/commits?limit=1" | python3 -c "import sys,json; print(json.load(sys.stdin)['items'][0]['commit_lsn'])")
+api_json "/commits/$ONE_LSN"
+ONE_CHANGES=$(api_get "/commits/$ONE_LSN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['changes']))")
+check "单笔事务（正常工作负载）含 5 条有序变更" "5" "$ONE_CHANGES"
+
 info "按样本号检索（S2026-0002，看到两次更正的前后值）"
 api_json "/changes?sample_no=S2026-0002"
+
+info "/changes 复合游标翻页（页边界落在事务中间也不丢行）"
+CH_TOTAL=$(log_sql -c "SELECT count(*) FROM result_change WHERE slot_name='$SLOT_NAME';")
+P1_NEXT=$(api_get "/changes?limit=2" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_cursor'] or '')")
+check "/changes 第一页返回 next_cursor（<LSN>:<seq>）" "true" "$([ -n "$P1_NEXT" ] && echo true || echo false)"
+P2_COUNT=$(api_get "/changes?limit=500&cursor=$P1_NEXT" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['items']))")
+check "翻页后取到剩余全部变更" "$((CH_TOTAL - 2))" "$P2_COUNT"
 
 section "结果"
 if [ "$FAIL" -eq 0 ]; then

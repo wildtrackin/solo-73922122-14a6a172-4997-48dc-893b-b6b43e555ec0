@@ -28,14 +28,15 @@
 
 | 要求 | 实现方式 |
 | --- | --- |
-| 只采集建槽后固定 `results` 表的增改删 | 采集器启动时创建持久逻辑复制槽；wal2json 选项 `add-tables=public.results`、`actions=insert,update,delete` |
+| 只采集建槽后固定 `results` 表的增改删 | 采集器启动时创建持久逻辑复制槽；wal2json 选项 `format-version=2`（逐条 B/I/U/D/C 消息；默认 v1 会把整笔事务封装成一条 JSON）、`add-tables=public.results`、`actions=insert,update,delete` |
 | 表含样本号、检测项目、结果 | 源表 `results(sample_no, test_item, result, ...)` |
-| 更正、删除保留完整旧值 | `ALTER TABLE results REPLICA IDENTITY FULL` + wal2json `include-old-keys`，旧值整行 JSONB 入库 |
+| 更正、删除保留完整旧值 | `ALTER TABLE results REPLICA IDENTITY FULL`；v2 消息中 `columns`=完整新值、`identity`=完整旧值，整行 JSONB 入库 |
 | 保存源事务号、提交位置、有序前后值 | `source_commit(xid, commit_lsn, begin_lsn, commit_time)` + `result_change(change_seq, old_values, new_values)`，同事务同行多次修改各占一行、按 `change_seq` 保序 |
 | 回滚不记录 | 逻辑解码只输出已提交事务，ROLLBACK 不产生任何消息 |
 | 整笔事务一次可见、顺序与源提交一致 | 每笔源事务在日志库一个本地事务中原子写入；按 `commit_lsn` 全局排序 |
-| 先持久提交再确认源位置 | 日志库 `COMMIT` 成功后才 `send_feedback(flush_lsn=end_lsn)`，源槽 `confirmed_flush_lsn/restart_lsn` 随后才推进 |
+| 先持久提交再确认源位置 | 日志库 `COMMIT` 成功后才 `send_feedback(flush_lsn=提交位置)`，源槽 `confirmed_flush_lsn/restart_lsn` 随后才推进 |
 | 落库后确认前退出/断流/重启，不漏不重 | 重启从持久槽旧位置重新解码；`source_commit(slot_name, commit_lsn)` 唯一约束 + `ON CONFLICT DO NOTHING` 幂等重放 |
+| 解析或落库失败不越过该事务 | 回调解析失败/落库失败即抛错断流；确认反馈只在落库成功后发出，重连后从槽的已确认位置重放，失败事务不被跳过 |
 | 不能靠扫描当前表补历史 | 唯一数据通道是复制槽 WAL 流；不读取 `results` 当前数据做任何补采 |
 | 采集停顿时源库仍可提交 | 复制槽保留所需 WAL（`/status` 的 `retained_wal_bytes` 可见），恢复后自动补采 |
 | 查询仅见完整事务 | 写入原子性保证；API 只读已提交数据 |
@@ -60,9 +61,19 @@ wal2json 消息 B,I,U,...,C
 在“日志库已提交、feedback 未生效”之间任何退出：源槽仍停在旧位置 → 重启重放该事务 →
 唯一约束幂等吞掉 → 再次确认。因此**不漏记、不重复**，且不依赖扫描当前表。
 
+### wal2json 消息格式（format-version 2）
+
+- `B` / `C`：事务信封；`C` 携带 `nextlsn`（事务 end_lsn，即提交位置）与 `timestamp`；
+- `I` / `U`：`columns` 为完整新值（`[{"name","type","value"}, ...]`）；
+- `U` / `D`：`identity` 为旧行标识，配合 `REPLICA IDENTITY FULL` 即完整旧值；
+- 每条行变更消息的 `lsn` 记录为 `row_lsn`；
+- 同事务多条变更按到达顺序编号 `change_seq`（从 1 起），与源库执行顺序一致；
+- 解析失败、未知消息类型、落库失败都会让采集器断流重试，确认位置不越过失败事务。
+
 ## 3. 快速启动
 
 ```bash
+cp .env.example .env          # 首次启动（compose 变量替换依赖 .env）
 docker compose up -d --build
 # 文档与接口
 open http://localhost:8000/docs      # Swagger UI
@@ -103,8 +114,8 @@ docker compose up -d --no-deps collector   # 正常重启续采
 | --- | --- |
 | `GET /docs` | Swagger 交互文档 |
 | `GET /commits?cursor=0/..&limit=20&direction=forward` | 按提交位置翻页，每页含整笔事务及有序前后值 |
-| `GET /commits/{commit_lsn}` | 取单笔事务（源 xid、提交位置、全部行变更） |
-| `GET /changes?sample_no=S2026-0002&action=U` | 按样本号/动作检索行级变更，删除也能按旧样本号追溯 |
+| `GET /commits/{commit_lsn}` | 取单笔事务（源 xid、提交位置、全部行变更）；LSN 含 `/`，直接拼在路径里即可 |
+| `GET /changes?sample_no=S2026-0002&action=U` | 按样本号/动作检索行级变更，删除也能按旧样本号追溯；游标为 `<commit_lsn>:<change_seq>` 复合键，同事务多条变更翻页不丢行 |
 | `GET /status` | 采集器存活心跳、已持久/已确认 LSN、源槽 active/restart_lsn、WAL 保留字节数 |
 
 ## 6. 运维说明

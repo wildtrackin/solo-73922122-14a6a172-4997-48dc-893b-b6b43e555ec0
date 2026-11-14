@@ -159,7 +159,8 @@ def list_commits(
     return CommitPage(items=page, next_cursor=next_cursor, has_more=has_more, limit=limit)
 
 
-@app.get("/commits/{commit_lsn}", response_model=Commit, summary="按提交位置取单笔事务及全部前后值")
+# LSN 含 '/'（如 0/1A2B3C8），必须用 path 转换器才能匹配
+@app.get("/commits/{commit_lsn:path}", response_model=Commit, summary="按提交位置取单笔事务及全部前后值")
 def get_commit(commit_lsn: str):
     if not lsn_valid(commit_lsn):
         raise HTTPException(status_code=400, detail=f"invalid LSN: {commit_lsn!r}")
@@ -199,11 +200,21 @@ def get_commit(commit_lsn: str):
 def list_changes(
     sample_no: str | None = Query(None, description="样本号，匹配 new/old 两侧，支持更正与删除追溯"),
     action: Literal["I", "U", "D"] | None = Query(None),
-    cursor: str | None = Query(None, description="提交位置 LSN 游标"),
+    cursor: str | None = Query(None, description="上一页返回的 next_cursor（格式 <commit_lsn>:<change_seq>），首页不传"),
     limit: int = Query(50, ge=1, le=500),
 ):
-    if cursor is not None and not lsn_valid(cursor):
-        raise HTTPException(status_code=400, detail=f"invalid cursor LSN: {cursor!r}")
+    # 游标为 (commit_lsn, change_seq) 复合键：同一事务可含多条变更，
+    # 仅用 commit_lsn 翻页会在页边界落在事务中间时丢掉同事务的剩余行。
+    cursor_lsn: str | None = None
+    cursor_seq = 0
+    if cursor is not None:
+        lsn_part, sep, seq_part = cursor.rpartition(":")
+        if not sep or not lsn_valid(lsn_part) or not seq_part.isdigit():
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid cursor {cursor!r}: expected '<commit_lsn>:<change_seq>'",
+            )
+        cursor_lsn, cursor_seq = lsn_part, int(seq_part)
 
     where = ["rc.slot_name = %s"]
     params: list[Any] = [settings.slot_name]
@@ -215,9 +226,9 @@ def list_changes(
     if action:
         where.append("rc.action = %s")
         params.append(action)
-    if cursor:
-        where.append("rc.commit_lsn > %s::pg_lsn")
-        params.append(cursor)
+    if cursor_lsn:
+        where.append("(rc.commit_lsn, rc.change_seq) > (%s::pg_lsn, %s)")
+        params.extend([cursor_lsn, cursor_seq])
 
     sql = f"""
         SELECT rc.commit_lsn::text AS commit_lsn, sc.xid, sc.commit_time,
@@ -239,7 +250,9 @@ def list_changes(
 
     has_more = len(rows) > limit
     page = rows[:limit]
-    next_cursor = page[-1]["commit_lsn"] if has_more and page else None
+    next_cursor = (
+        f"{page[-1]['commit_lsn']}:{page[-1]['change_seq']}" if has_more and page else None
+    )
     return ChangePage(items=page, next_cursor=next_cursor, has_more=has_more, limit=limit)
 
 
